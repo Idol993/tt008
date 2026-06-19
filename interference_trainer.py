@@ -129,20 +129,24 @@ class TraceReinforcedInterferenceTrainer:
         target_modules: List[str],
         interference_weights: Dict[str, float],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        with torch.no_grad():
+            _ = self.model(replay_data["input"])
+            normal_outputs = self.model.get_all_module_outputs()
+
         _ = self.model(adv_inputs)
-        current_outputs = self.model.get_all_module_outputs()
+        adv_outputs = self.model.get_all_module_outputs()
 
         interference_loss = torch.tensor(0.0, device=self.device)
         per_module_loss: Dict[str, float] = {}
 
         for mod_name in target_modules:
-            if mod_name not in current_outputs:
+            if mod_name not in adv_outputs:
                 continue
             stored_key = f"module_{mod_name}"
             if stored_key not in replay_data:
                 continue
 
-            cur_out = current_outputs[mod_name]
+            cur_out = adv_outputs[mod_name]
             ref_out = replay_data[stored_key]
 
             min_batch = min(cur_out.size(0), ref_out.size(0))
@@ -152,11 +156,21 @@ class TraceReinforcedInterferenceTrainer:
             cur_flat = cur_out[:min_batch].reshape(min_batch, -1)
             ref_flat = ref_out[:min_batch].reshape(min_batch, -1).detach()
 
-            feature_diff = F.mse_loss(cur_flat, ref_flat)
+            adv_mse = F.mse_loss(cur_flat, ref_flat).item()
+
+            normal_mse = 0.0
+            if mod_name in normal_outputs:
+                nor = normal_outputs[mod_name][:min_batch].reshape(min_batch, -1)
+                normal_mse = F.mse_loss(nor, ref_flat).item()
+
             weight = interference_weights.get(mod_name, 1.0)
-            weighted = weight * feature_diff
+            weighted = weight * F.mse_loss(cur_flat, ref_flat)
             interference_loss = interference_loss + weighted
-            per_module_loss[mod_name] = feature_diff.item()
+            per_module_loss[mod_name] = adv_mse
+            per_module_loss[f"{mod_name}__normal_mse"] = normal_mse
+            per_module_loss[f"{mod_name}__adv_mse"] = adv_mse
+            per_module_loss[f"{mod_name}__shift"] = adv_mse - normal_mse
+            per_module_loss[f"{mod_name}__weight"] = weight
 
         return interference_loss, per_module_loss
 
@@ -204,7 +218,13 @@ class TraceReinforcedInterferenceTrainer:
         angle_new_proj = float(np.arccos(np.clip(cos_new_proj, -1.0, 1.0))) * 180.0 / np.pi
         angle_new_merged = float(np.arccos(np.clip(cos_new_merged, -1.0, 1.0))) * 180.0 / np.pi
 
-        proj_ratio = (proj_norm / (old_norm + eps))
+        new_norm_sq = torch.dot(g_new, g_new).item()
+        old_norm_sq = torch.dot(g_old, g_old).item()
+        new_component_in_merged = (torch.dot(g_merged, g_new) / (new_norm_sq + eps)).item()
+
+        dot_new_old = torch.dot(g_new, g_old).item()
+        dot_new_proj = torch.dot(g_new, g_proj).item()
+        dot_new_merged = torch.dot(g_merged, g_new).item()
 
         return {
             "g_new_norm": new_norm,
@@ -217,7 +237,10 @@ class TraceReinforcedInterferenceTrainer:
             "angle_new_old_deg": angle_new_old,
             "angle_new_proj_deg": angle_new_proj,
             "angle_new_merged_deg": angle_new_merged,
-            "proj_ratio": proj_ratio,
+            "new_component_ratio": new_component_in_merged,
+            "dot_new_old": dot_new_old,
+            "dot_new_proj": dot_new_proj,
+            "dot_new_merged": dot_new_merged,
         }
 
     def _orthogonal_project_old_onto_new(
@@ -308,8 +331,10 @@ class TraceReinforcedInterferenceTrainer:
         interference_weights: Dict[str, float] = {}
         per_module_interference: Dict[str, float] = {}
         grad_proj_info: Dict[str, float] = {}
+        grad_diag: Dict[str, float] = {}
 
         old_task_grads: Dict[str, torch.Tensor] = {}
+        merged_grads: Dict[str, torch.Tensor] = {}
 
         if has_old_tasks:
             # (2a) Sample replay + collect STORED module traces as reference
@@ -429,6 +454,10 @@ class TraceReinforcedInterferenceTrainer:
                     a_old = grad_diag.get("angle_new_old_deg", 0)
                     a_proj = grad_diag.get("angle_new_proj_deg", 0)
                     a_mrg = grad_diag.get("angle_new_merged_deg", 0)
+                    ncr = grad_diag.get("new_component_ratio", 0)
+                    d_old = grad_diag.get("dot_new_old", 0)
+                    d_proj = grad_diag.get("dot_new_proj", 0)
+                    conflict = "⚡CONFLICT" if d_old < 0 else ""
                     print(
                         f"  Grad: ‖new‖={grad_diag['g_new_norm']:.3f} "
                         f"‖old‖={grad_diag['g_old_norm']:.3f} "
@@ -436,7 +465,9 @@ class TraceReinforcedInterferenceTrainer:
                         f"‖merged‖={grad_diag['g_merged_norm']:.3f} | "
                         f"∠(new,old)={a_old:.1f}° "
                         f"∠(new,proj)={a_proj:.1f}° "
-                        f"∠(new,merged)={a_mrg:.1f}°"
+                        f"∠(new,merged)={a_mrg:.1f}° | "
+                        f"dot(n,o)={d_old:+.2f} dot(n,p)={d_proj:+.2f} "
+                        f"new_comp={ncr:.3f} {conflict}"
                     )
 
         # =========================================================
@@ -453,7 +484,6 @@ class TraceReinforcedInterferenceTrainer:
             "replay_loss": replay_loss_val,
             "interference_loss": interference_loss_val,
             "step": current_step,
-            "new_grad_norm": new_grad_norm,
             "num_fastest_modules": len(fastest_modules),
         }
 
@@ -465,6 +495,9 @@ class TraceReinforcedInterferenceTrainer:
                 loss_info[f"interf_loss__{mod}"] = per_module_interference[mod]
 
         for k, v in grad_proj_info.items():
+            loss_info[f"proj_{k}"] = v
+
+        for k, v in grad_diag.items():
             loss_info[f"grad_{k}"] = v
 
         self._loss_history.append(loss_info)
