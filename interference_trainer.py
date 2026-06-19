@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Dict, List, Optional, Tuple
 
 from forgetting_detector import ForgettingTraceDetector
@@ -170,6 +171,54 @@ class TraceReinforcedInterferenceTrainer:
         for name, param in self.model.named_parameters():
             if name in grads:
                 param.grad = grads[name].clone()
+
+    def _flatten_grads(self, grads: Dict[str, torch.Tensor]) -> torch.Tensor:
+        parts = []
+        for name in sorted(grads.keys()):
+            parts.append(grads[name].flatten())
+        return torch.cat(parts)
+
+    def _compute_grad_diagnostics(
+        self,
+        new_grads: Dict[str, torch.Tensor],
+        old_grads: Dict[str, torch.Tensor],
+        proj_old_grads: Dict[str, torch.Tensor],
+        merged_grads: Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        g_new = self._flatten_grads(new_grads)
+        g_old = self._flatten_grads(old_grads)
+        g_proj = self._flatten_grads(proj_old_grads)
+        g_merged = self._flatten_grads(merged_grads)
+
+        new_norm = g_new.norm().item()
+        old_norm = g_old.norm().item()
+        proj_norm = g_proj.norm().item()
+        merged_norm = g_merged.norm().item()
+
+        eps = 1e-12
+        cos_new_old = (torch.dot(g_new, g_old) / (new_norm * old_norm + eps)).item()
+        cos_new_proj = (torch.dot(g_new, g_proj) / (new_norm * proj_norm + eps)).item()
+        cos_new_merged = (torch.dot(g_new, g_merged) / (new_norm * merged_norm + eps)).item()
+
+        angle_new_old = float(np.arccos(np.clip(cos_new_old, -1.0, 1.0))) * 180.0 / np.pi
+        angle_new_proj = float(np.arccos(np.clip(cos_new_proj, -1.0, 1.0))) * 180.0 / np.pi
+        angle_new_merged = float(np.arccos(np.clip(cos_new_merged, -1.0, 1.0))) * 180.0 / np.pi
+
+        proj_ratio = (proj_norm / (old_norm + eps))
+
+        return {
+            "g_new_norm": new_norm,
+            "g_old_norm": old_norm,
+            "g_proj_norm": proj_norm,
+            "g_merged_norm": merged_norm,
+            "cos_new_old": cos_new_old,
+            "cos_new_proj": cos_new_proj,
+            "cos_new_merged": cos_new_merged,
+            "angle_new_old_deg": angle_new_old,
+            "angle_new_proj_deg": angle_new_proj,
+            "angle_new_merged_deg": angle_new_merged,
+            "proj_ratio": proj_ratio,
+        }
 
     def _orthogonal_project_old_onto_new(
         self,
@@ -343,17 +392,24 @@ class TraceReinforcedInterferenceTrainer:
                         new_task_grads, old_task_grads
                     )
 
-                    # Combine: g_final = g_new + g_old_proj  (add, never subtract g_new)
                     self.model.zero_grad()
+                    merged_grads: Dict[str, torch.Tensor] = {}
                     for name, param in self.model.named_parameters():
+                        combined = torch.zeros_like(param)
                         if name in new_task_grads:
-                            combined = new_task_grads[name].clone()
-                            if name in projected_old_grads:
-                                combined = combined + projected_old_grads[name]
-                            param.grad = combined
+                            combined = combined + new_task_grads[name]
+                        if name in projected_old_grads:
+                            combined = combined + projected_old_grads[name]
+                        param.grad = combined
+                        merged_grads[name] = combined.clone()
+
+                    grad_diag = self._compute_grad_diagnostics(
+                        new_task_grads, old_task_grads, projected_old_grads, merged_grads
+                    )
                 else:
-                    # No projection: g_final = g_new + g_old (straight sum)
                     self.model.zero_grad()
+                    merged_grads = {}
+                    proj_for_diag: Dict[str, torch.Tensor] = {}
                     for name, param in self.model.named_parameters():
                         combined = torch.zeros_like(param)
                         if name in new_task_grads:
@@ -361,6 +417,27 @@ class TraceReinforcedInterferenceTrainer:
                         if name in old_task_grads:
                             combined = combined + old_task_grads[name]
                         param.grad = combined
+                        merged_grads[name] = combined.clone()
+                        if name in old_task_grads:
+                            proj_for_diag[name] = old_task_grads[name].clone()
+
+                    grad_diag = self._compute_grad_diagnostics(
+                        new_task_grads, old_task_grads, proj_for_diag, merged_grads
+                    )
+
+                if self.verbose and len(old_task_grads) > 0:
+                    a_old = grad_diag.get("angle_new_old_deg", 0)
+                    a_proj = grad_diag.get("angle_new_proj_deg", 0)
+                    a_mrg = grad_diag.get("angle_new_merged_deg", 0)
+                    print(
+                        f"  Grad: ‖new‖={grad_diag['g_new_norm']:.3f} "
+                        f"‖old‖={grad_diag['g_old_norm']:.3f} "
+                        f"‖proj‖={grad_diag['g_proj_norm']:.3f} "
+                        f"‖merged‖={grad_diag['g_merged_norm']:.3f} | "
+                        f"∠(new,old)={a_old:.1f}° "
+                        f"∠(new,proj)={a_proj:.1f}° "
+                        f"∠(new,merged)={a_mrg:.1f}°"
+                    )
 
         # =========================================================
         # PHASE 6: Optimizer step

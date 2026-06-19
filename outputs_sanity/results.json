@@ -1,0 +1,33 @@
+{
+  "task_accuracies": {
+    "0": {
+      "0": 0.205
+    },
+    "1": {
+      "0": 0.205,
+      "1": 0.214
+    },
+    "2": {
+      "0": 0.205,
+      "1": 0.213,
+      "2": 0.202
+    }
+  },
+  "final_forgetting_rates": {
+    "low_level": 0.0,
+    "mid_level": 0.0,
+    "high_level": 0.0,
+    "classifier": 0.03980816714465618
+  },
+  "config": {
+    "num_tasks": 3,
+    "epochs_per_task": 2,
+    "lr": 0.01,
+    "replay_buffer_size": 100,
+    "interference_base_weight": 0.5,
+    "forgetting_rate_scale": 10.0,
+    "max_interference_weight": 2.0,
+    "top_k_forgetting": 2,
+    "use_orthogonal_projection": true
+  }
+}
